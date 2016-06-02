@@ -15,11 +15,11 @@
 -- ==
 --
 -- structure distributed {
---   MapKernel 6
---   ScanKernel 2
---   Map 0
---   Concat 1
---   Reduce 0
+--   /If/True/MapKernel 1
+--   /If/False/MapKernel 1
+--   /If/False/If/True/MapKernel 1
+--   /If/False/If/False/MapKernel 5
+--   /If/False/If/False/ScanKernel 2
 -- }
 
 fun [([int],[int])] main([[[int],an],n] a, [[int,bn],n] b) =

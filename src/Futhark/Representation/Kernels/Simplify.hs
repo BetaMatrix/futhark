@@ -105,6 +105,7 @@ instance (Attributes lore, Engine.SimplifiableOp lore (Op lore)) =>
 
   simplifyOp NumGroups = return NumGroups
   simplifyOp GroupSize = return GroupSize
+  simplifyOp (SufficientParallelism se) = SufficientParallelism <$> Engine.simplify se
 
 simplifyKernelInput :: Engine.MonadEngine m =>
                        KernelInput (Engine.InnerLore m) -> m (KernelInput (Lore m))

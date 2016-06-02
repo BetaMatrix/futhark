@@ -593,6 +593,9 @@ allocInExp (Op GroupSize) =
 allocInExp (Op NumGroups) =
   return $ Op $ Inner NumGroups
 
+allocInExp (Op (SufficientParallelism se)) =
+  return $ Op $ Inner $ SufficientParallelism se
+
 allocInExp (Apply fname args rettype) = do
   args' <- funcallArgs args
   return $ Apply fname args' (memoryInRetType rettype)

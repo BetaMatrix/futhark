@@ -374,8 +374,22 @@ distributeMap pat (MapLoop cs w lam arrs) = do
                       , kernelScope =
                         types <> scopeForKernels (scopeOf lam)
                       }
-  fmap (postKernelBindings . snd) $ runKernelM env $
+  let res = map Var $ patternNames pat
+  par_bnds <- fmap (postKernelBindings . snd) $ runKernelM env $
     distribute =<< distributeMapBodyBindings acc (bodyBindings $ lambdaBody lam)
+
+  if not $ containsNestedParallelism lam
+    then return par_bnds
+    else do
+    par_body <- renameBody $ mkBody par_bnds res
+
+    seq_bnds <- do
+      soactypes <- asksScope scopeForSOACs
+      (seq_lam, _) <- runBinderT (FOT.transformLambda lam) soactypes
+      fmap (postKernelBindings . snd) $ runKernelM env $
+        distribute =<< distributeMapBodyBindings acc (bodyBindings $ lambdaBody seq_lam)
+    seq_body <- renameBody $ mkBody seq_bnds res
+    kernelAlternatives w pat seq_body par_body
     where acc = KernelAcc { kernelTargets = singleTarget (pat, bodyResult $ lambdaBody lam)
                           , kernelBindings = mempty
                           }
@@ -447,6 +461,12 @@ runKernelM env (KernelM m) = do
   return (x, accPostKernels res)
   where getKernels (x,s,a) = ((x, a), s)
 
+collectKernels :: KernelM a -> KernelM (a, PostKernels)
+collectKernels m = pass $ do
+  (x, res) <- listen m
+  return ((x, accPostKernels res),
+          const res { accPostKernels = mempty })
+
 addKernels :: PostKernels -> KernelM ()
 addKernels ks = tell $ mempty { accPostKernels = ks }
 
@@ -473,6 +493,17 @@ mapNesting pat cs w lam arrs = local $ \env ->
   where nest = Nesting mempty $
                MapNesting pat cs w $
                zip (lambdaParams lam) arrs
+
+inNesting :: KernelNest -> KernelM a -> KernelM a
+inNesting (outer, nests) = local $ \env ->
+  env { kernelNest = (inner, nests')
+      , kernelScope = kernelScope env <> mconcat (map scopeOf $ outer : nests)
+      }
+  where (inner, nests') =
+          case reverse nests of
+            []           -> (asNesting outer, [])
+            (inner' : ns) -> (asNesting inner', map asNesting $ outer : reverse ns)
+        asNesting = Nesting mempty
 
 unbalancedLambda :: Lambda -> Bool
 unbalancedLambda lam =
@@ -521,16 +552,55 @@ distributeInnerMap :: Pattern -> MapLoop -> KernelAcc
 distributeInnerMap pat maploop@(MapLoop cs w lam arrs) acc
   | unbalancedLambda lam =
       addBindingToKernel (Let pat () $ mapLoopExp maploop) acc
+  | not $ containsNestedParallelism lam =
+      distributeNormally foo_acc
   | otherwise =
-      distribute =<<
-      leavingNesting maploop =<<
-      mapNesting pat cs w lam arrs
-      (distribute =<< distributeMapBodyBindings acc' (bodyBindings $ lambdaBody lam))
-      where acc' = KernelAcc { kernelTargets = pushInnerTarget
-                                               (pat, bodyResult $ lambdaBody lam) $
-                                               kernelTargets acc
-                             , kernelBindings = mempty
-                             }
+      distributeSingleBinding acc bnd >>= \case
+      Nothing ->
+        distributeNormally foo_acc
+      Just (post_kernels, _, nest, acc') -> do
+        addKernels post_kernels
+        -- The kernel can be distributed by itself, so now we can
+        -- decide whether to just sequentialise, or exploit inner
+        -- parallelism.
+        let map_nesting = MapNesting pat cs w $ zip (lambdaParams lam) arrs
+            nest' = pushInnerKernelNesting (pat, lam_res) map_nesting nest
+            par_acc = KernelAcc { kernelTargets = pushInnerTarget
+                                  (pat, lam_res) $ kernelTargets acc
+                                , kernelBindings = mempty
+                                }
+            extra_scope = targetsScope $ kernelTargets acc'
+        (_, distributed_kernels) <- collectKernels $
+          localScope extra_scope $ inNesting nest' $
+          distribute =<< leavingNesting maploop =<< distribute =<<
+          distributeMapBodyBindings par_acc lam_bnds
+
+        sequentialised_map_body <-
+          localScope (scopeOfLParams (lambdaParams lam)) $ runBinder_ $
+          mapM_ FOT.transformBindingRecursively $ bodyBindings $ lambdaBody lam
+        (par_bnds, par, sequentialised_kernel) <-
+          constructKernel nest' $ mkBody sequentialised_map_body lam_res
+
+        let outer_pat = loopNestingPattern $ fst nest
+            res' = map Var $ patternNames outer_pat
+        seq_body <- renameBody $ mkBody [sequentialised_kernel] res'
+        par_body <- renameBody $ mkBody (postKernelBindings distributed_kernels) res'
+        addKernel =<< kernelAlternatives par outer_pat seq_body par_body
+        addKernel par_bnds
+        return acc'
+      where bnd = Let pat () $ mapLoopExp maploop
+            lam_bnds = bodyBindings $ lambdaBody lam
+            lam_res = bodyResult $ lambdaBody lam
+            foo_acc = KernelAcc { kernelTargets = pushInnerTarget
+                                  (pat, bodyResult $ lambdaBody lam) $
+                                  kernelTargets acc
+                                , kernelBindings = mempty
+                                }
+            distributeNormally acc' =
+              distribute =<<
+              leavingNesting maploop =<<
+              mapNesting pat cs w lam arrs
+              (distribute =<< distributeMapBodyBindings acc' lam_bnds)
 
 leavingNesting :: MapLoop -> KernelAcc -> KernelM KernelAcc
 leavingNesting (MapLoop cs w lam arrs) acc =
@@ -821,6 +891,24 @@ isSegmentedOp nest perm segment_size lam scan_inps m = runMaybeT $ do
 
 
     m pat flat_pat nesting_size total_num_elements op_inps'
+
+containsNestedParallelism :: Lambda -> Bool
+containsNestedParallelism lam =
+  any (parallel . bindingExp) lam_bnds &&
+  not (perfectMapNest lam_bnds)
+  where lam_bnds = bodyBindings $ lambdaBody lam
+        parallel Op{} = True
+        parallel _    = False
+        perfectMapNest [Let _ _ (Op Map{})] = True
+        perfectMapNest _                    = False
+
+kernelAlternatives :: (MonadFreshNames m, HasScope Out.Kernels m) =>
+                      SubExp -> Out.Pattern -> Out.Body -> Out.Body
+                   -> m [Out.Binding]
+kernelAlternatives parallelism pat seq_body par_body = runBinder_ $ do
+  suff <- letSubExp "sufficient_parallelism" $ Op $ SufficientParallelism parallelism
+  letBind_ pat $ If suff seq_body par_body rettype
+  where rettype = staticShapes $ patternTypes pat
 
 kernelOrNot :: Binding -> KernelAcc
             -> PostKernels -> KernelAcc -> Maybe [Out.Binding]

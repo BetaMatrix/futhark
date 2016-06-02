@@ -20,9 +20,10 @@
 --    [662i32, 1090i32, 1728i32]]
 -- }
 -- structure distributed {
---   DoLoop/MapKernel 1
---   MapKernel/DoLoop/DoLoop 2
---   ScanKernel 2
+--   /If/True/MapKernel 1
+--   /If/False/DoLoop/If/True/MapKernel 1
+--   /If/False/DoLoop/If/False/MapKernel 4
+--   /If/False/DoLoop/If/False/ScanKernel 2
 -- }
 
 fun ([[[int,m],m],n], [[int,m],n]) main([[int,m],n] pss) =

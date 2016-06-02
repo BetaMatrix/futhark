@@ -75,6 +75,13 @@ kernelCompiler dest GroupSize = do
   [v] <- ImpGen.funcallTargets dest
   ImpGen.emit $ Imp.Op $ Imp.GetGroupSize v
 
+kernelCompiler dest (SufficientParallelism se) = do
+  [v] <- ImpGen.funcallTargets dest
+  ImpGen.emit $
+    Imp.SetScalar v $
+    Imp.CmpOp (CmpSlt Int32) (64*1024) $
+    ImpGen.compileSubExp se
+
 kernelCompiler
   (ImpGen.Destination dest)
   (MapKernel _ _ global_thread_index ispace inps returns body) = do

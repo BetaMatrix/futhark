@@ -3,11 +3,12 @@
 --
 -- ==
 -- structure distributed {
---   MapKernel 3
---   Map 0
---   DoLoop 3
---   Reduce 0
---   Redomap 0
+--   /MapKernel 0
+--   /If/True/MapKernel 2
+--   /If/False/MapKernel 1
+--   /If/False/If/True/MapKernel 1
+--   /If/False/If/False/MapKernel 2
+--   Scan 0
 -- }
 
 fun [f64] take(int n, [f64] a) = let (first, rest) = unsafe split((n), a) in first

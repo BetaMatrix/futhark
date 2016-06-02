@@ -80,6 +80,7 @@ data Kernel lore =
 
   | NumGroups
   | GroupSize
+  | SufficientParallelism SubExp -- ^ True if enough parallelism.
     deriving (Eq, Show, Ord)
 
 data KernelInput lore = KernelInput { kernelInputParam :: LParam lore
@@ -182,6 +183,8 @@ mapKernelM tv (WriteKernel cs ts i vs as) =
   mapM (mapOnKernelVName tv) as
 mapKernelM _ NumGroups = pure NumGroups
 mapKernelM _ GroupSize = pure GroupSize
+mapKernelM tv (SufficientParallelism se) =
+  SufficientParallelism <$> mapOnKernelSubExp tv se
 
 -- FIXME: Make this less hacky.
 mapOnKernelType :: (Monad m, Applicative m, Functor m) =>
@@ -306,6 +309,8 @@ kernelType NumGroups =
   [Prim int32]
 kernelType GroupSize =
   [Prim int32]
+kernelType SufficientParallelism{} =
+  [Prim Bool]
 
 chunkedKernelNonconcatOutputs :: Lambda lore -> Int
 chunkedKernelNonconcatOutputs fun =
@@ -384,6 +389,7 @@ instance (Aliased lore, UsageInOp (Op lore)) => UsageInOp (Kernel lore) where
     mconcat $ map UT.consumedUsage as
   usageInOp NumGroups = mempty
   usageInOp GroupSize = mempty
+  usageInOp SufficientParallelism{} = mempty
 
 typeCheckKernel :: TC.Checkable lore => Kernel (Aliases lore) -> TC.TypeM lore ()
 
@@ -526,6 +532,7 @@ typeCheckKernel (WriteKernel cs ts i vs as) = do
 
 typeCheckKernel NumGroups = return ()
 typeCheckKernel GroupSize = return ()
+typeCheckKernel SufficientParallelism{} = return ()
 
 checkKernelCrud :: TC.Checkable lore =>
                    [VName] -> SubExp -> KernelSize -> TC.TypeM lore ()
@@ -578,6 +585,7 @@ instance OpMetrics (Op lore) => OpMetrics (Kernel lore) where
     inside "WriteKernel" $ return ()
   opMetrics NumGroups = seen "NumGroups"
   opMetrics GroupSize = seen "GroupSize"
+  opMetrics SufficientParallelism{} = seen "SufficientParallelism"
 
 instance PrettyLore lore => PP.Pretty (Kernel lore) where
   ppr (MapKernel cs w index ispace inps returns body) =
@@ -619,6 +627,7 @@ instance PrettyLore lore => PP.Pretty (Kernel lore) where
     PP.align (PP.semisep [ppr i, commasep $ map ppr vs, commasep $ map ppr as])
   ppr NumGroups = text "$num_groups()"
   ppr GroupSize = text "$group_size()"
+  ppr (SufficientParallelism se) = text "$sufficientParallelism" <> parens (ppr se)
 
 instance Pretty KernelSize where
   ppr (KernelSize

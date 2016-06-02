@@ -12,7 +12,11 @@
 --     scan
 --
 -- ==
--- structure distributed { MapKernel 3 }
+-- structure distributed {
+--   /If/True/MapKernel 2
+--   /If/False/If/True/MapKernel 2
+--   /If/False/If/False/MapKernel 3
+-- }
 
 fun [f64] combineVs([f64] n_row, [f64] vol_row, [f64] dr_row) =
     map(+, zip(dr_row, map(*, zip(n_row, vol_row ) )))
