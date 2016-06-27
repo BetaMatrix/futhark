@@ -8,6 +8,7 @@ module Futhark.Pass.ExplicitAllocations
 where
 
 import Control.Applicative
+import Control.Arrow hiding (arr)
 import Control.Monad.State
 import Control.Monad.Writer
 import Control.Monad.Reader
@@ -484,6 +485,11 @@ allocInBody (Body _ bnds res) =
             else do (_, _, v') <- ensureDirectArray v
                     return v'
 
+allocInBodyNoDirect :: In.Body -> AllocM Body
+allocInBodyNoDirect (Body _ bnds res) =
+  allocInBindings bnds $ \bnds' ->
+    return $ Body () bnds' res
+
 allocInBindings :: [In.Binding] -> ([Binding] -> AllocM a)
                 -> AllocM a
 allocInBindings origbnds m = allocInBindings' origbnds []
@@ -566,17 +572,6 @@ allocInExp (Op (ChunkedMapKernel cs w size o lam arrs)) = do
           lam arr_summaries
   return $ Op $ Inner $ ChunkedMapKernel cs w size o lam' arrs
 
-allocInExp (Op (ReduceKernel cs w size comm red_lam fold_lam arrs)) = do
-  arr_summaries <- mapM lookupMemBound arrs
-  fold_lam' <- allocInFoldLambda
-               comm
-               (kernelElementsPerThread size)
-               (kernelNumThreads size)
-               fold_lam arr_summaries
-  red_lam' <- allocInReduceLambda red_lam num_accs (kernelWorkgroupSize size)
-  return $ Op $ Inner $ ReduceKernel cs w size comm red_lam' fold_lam' arrs
-  where num_accs = length $ lambdaReturnType red_lam
-
 allocInExp (Op (ScanKernel cs w size lam foldlam nes arrs)) = do
   lam' <- allocInReduceLambda lam (length nes) $ kernelWorkgroupSize size
   foldlam' <- allocInReduceLambda foldlam (length nes) $ kernelWorkgroupSize size
@@ -603,6 +598,11 @@ allocInExp (Op (WriteKernel cs len lam ivs as)) = do
               return param { paramAttr = summary }
             Mem size shape ->
               return param { paramAttr = MemMem size shape }
+
+allocInExp (Op (Kernel cs size ts thread_id body)) = do
+  body' <- localScope (HM.singleton thread_id IndexInfo) $
+    allocInKernelBody size thread_id body
+  return $ Op $ Inner $ Kernel cs size ts thread_id body'
 
 allocInExp (Op GroupSize) =
   return $ Op $ Inner GroupSize
@@ -726,6 +726,102 @@ allocInLambda params body rettype = do
            return $ Body () bnds' $ bodyResult body
   return $ Lambda params body' rettype
 
+allocInKernelBody :: (SubExp, SubExp, SubExp) -> VName -> KernelBody In.Kernels
+                  -> AllocM (KernelBody ExplicitMemory)
+allocInKernelBody size thread_id (KernelBody stms res) =
+  allocInKernelStms size thread_id stms $ \stms' ->
+    return $ KernelBody stms' res
+
+allocInKernelStms :: (SubExp, SubExp, SubExp)
+                  -> VName
+                  -> [KernelStm In.Kernels]
+                  -> ([KernelStm ExplicitMemory] -> AllocM a)
+                  -> AllocM a
+allocInKernelStms groups_and_size thread_id origstms m = allocInStms' mempty origstms []
+  where allocInStms' _ [] stms' =
+          m stms'
+        allocInStms' size_substs (x:xs) stms' = do
+          (allocstms, size_substs') <- allocInKernelStm groups_and_size size_substs thread_id x
+          let summaries = mconcat $ map scopeOf allocstms
+          localScope summaries $
+            allocInStms' size_substs' xs (stms'++allocstms)
+
+allocInKernelStm :: (SubExp, SubExp, SubExp)
+                 -> ChunkBounds
+                 -> VName
+                 -> KernelStm In.Kernels
+                 -> AllocM ([KernelStm ExplicitMemory],
+                            ChunkBounds)
+allocInKernelStm
+  (_, _, num_threads) size_substs thread_id
+  (SplitArray (size,chunks) o w elems_per_thread arrs) = do
+
+  chunks' <- forM (zip chunks arrs) $ \(chunk, arr) -> do
+    (mem, ixfun) <- lookupArraySummary arr
+    let num_threads' = SE.intSubExpToScalExp num_threads
+        elems_per_thread' = SE.intSubExpToScalExp elems_per_thread
+        shape = arrayShape $ patElemType chunk
+        bt = elemType $ patElemType chunk
+        attr =
+          case o of
+            InOrder ->
+              let newshape = [DimNew num_threads', DimNew elems_per_thread']
+              in ArrayMem bt shape NoUniqueness mem $
+                 IxFun.applyInd
+                 (IxFun.reshape ixfun $
+                   newshape ++
+                   map (DimNew . SE.intSubExpToScalExp)
+                   (drop 1 $ shapeDims shape))
+                 [SE.Id thread_id int32]
+            Disorder ->
+              let newshape = [DimNew elems_per_thread', DimNew num_threads']
+                  perm = [1,0] ++ [2..IxFun.rank ixfun]
+              in ArrayMem bt shape NoUniqueness mem $
+                 IxFun.applyInd
+                 (IxFun.permute (IxFun.reshape ixfun $
+                                  newshape ++
+                                  map (DimNew . SE.intSubExpToScalExp)
+                                  (drop 1 $ shapeDims shape))
+                   perm)
+                 [SE.Id thread_id int32]
+    return chunk { patElemAttr = attr }
+  return ([SplitArray (size, chunks') o w elems_per_thread arrs],
+          HM.insert size elems_per_thread size_substs)
+
+allocInKernelStm (_, group_size, num_threads) size_substs _thread_index (Thread pes body) = do
+  body' <- allocInBodyNoDirect body
+  pes' <- mapM (threadMemory num_threads) pes
+  return ([Thread pes' body'], size_substs)
+  where threadMemory _num_threads pe
+          | Array bt shape u <- patElemType pe = do
+              -- Heuristic: put non-scalar arrays in global memory.
+              let space = if shapeRank shape == 1
+                          then Space "local"
+                          else DefaultSpace
+                  pe_t = substituteBounds size_substs $ patElemType pe
+              (_, mem) <- allocForArray pe_t space
+              let ixfun = case shapeRank shape of
+                    1 ->
+                      IxFun.iota [SE.intSubExpToScalExp group_size]
+                    _ ->
+                      let dims = map SE.intSubExpToScalExp $ shapeDims shape
+                          perm = [1..length dims-2] ++ [0]
+                          root_ixfun = IxFun.iota dims
+                          permuted_ixfun = IxFun.permute root_ixfun perm
+                      in permuted_ixfun
+              return pe { patElemAttr = ArrayMem bt shape u mem ixfun }
+          | otherwise = fail $ "threadMemory: pattern element " ++
+                        pretty pe ++
+                        " not an array."
+
+allocInKernelStm (_, group_size, _) size_substs _ (GroupReduce pes w lam input) = do
+  lam' <- allocInReduceLambda lam num_accs group_size
+  let rts = extReturns $ staticShapes $ lambdaReturnType lam
+  ([], pes', []) <-
+    allocsForPattern [] (map (patElemIdent &&& patElemBindage) pes) rts
+  return ([GroupReduce pes' w lam' input], size_substs)
+  where num_accs = length input
+
 simplifiable :: (Engine.MonadEngine m,
                  Engine.InnerLore m ~ ExplicitMemory) =>
                 SimpleOps m
@@ -749,3 +845,11 @@ bindPatternWithAllocations types names e = do
   (pat,prebnds) <- runPatAllocM (patternWithAllocations names e) types
   mapM_ bindAllocBinding prebnds
   return pat
+
+type ChunkBounds = HM.HashMap VName SubExp
+
+substituteBounds :: ChunkBounds -> Type -> Type
+substituteBounds substs t = t `setArrayDims` map subst (arrayDims t)
+  where subst (Var v)
+          | Just se <- HM.lookup v substs = se
+        subst d = d
